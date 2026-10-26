@@ -214,7 +214,7 @@ def build_catalog() -> dict:
             "VTransform 输出。",
             "作为 fuser.plan 的 camera binding。",
             "80 通道、180×180 的 BEV feature。",
-            ["manifest-fusion", "fusion-runtime"], related=["vtransform", "fuser"]
+            ["manifest-fusion", "fusion-runtime"], related=["vtransform", "fusion-concat"]
         ),
         "camera-pipeline": node(
             "Camera Encoder", "CUDA + 2×TensorRT + BEVPool", "compute",
@@ -305,7 +305,7 @@ def build_catalog() -> dict:
             "SparseToDense/reshape 输出。",
             "作为 fuser.plan 的 lidar binding。",
             "256 通道、180×180 的 BEV feature。",
-            ["fusion-bindings", "fusion-runtime", "scatter-dense"], related=["sparse-dense", "fuser"]
+            ["fusion-bindings", "fusion-runtime", "scatter-dense"], related=["sparse-dense", "fusion-concat"]
         ),
         "lidar-pipeline": node(
             "LiDAR Sparse Encoder", "CUDA voxelize + libscn.so + libspconv.so", "compute",
@@ -314,6 +314,88 @@ def build_catalog() -> dict:
             "Voxelize → ONNX parser/libscn → indice generation/Mask Implicit GEMM → ScatterDense。",
             "LiDAR BEV [1,256,180,180]。",
             ["lidar-scn", "sparse-build", "sparse-doc"], related=["voxelize", "libscn", "libspconv", "lidar-bev"], view="lidar"
+        ),
+        "fusion-concat": node(
+            "Camera + LiDAR 通道拼接", "Cat(dim=1) · 80 + 256 = 336", "compute",
+            "两种传感器已经投影到同一个 180×180 BEV 网格；这里不做相加或注意力，而是保留两边的全部通道并沿 C 维拼接。",
+            "camera [1,80,180,180]；lidar [1,256,180,180]。",
+            "X = Cat(camera, lidar, dim=1)。Batch、高度和宽度保持不变，通道数由 80+256 变为 336。",
+            "concat [1,336,180,180] FP16。",
+            ["fusion-runtime", "fusion-bindings", "manifest-fusion", "convfuser-config"],
+            related=["camera-bev", "lidar-bev", "convfuser"], view="fusion",
+            formula="X = Cat(Fcamera, Flidar, dim=1)\n[1,80,180,180] + [1,256,180,180] → [1,336,180,180]"
+        ),
+        "convfuser": node(
+            "ConvFuser 3×3", "336→256 · BN · ReLU", "compute",
+            "3×3 卷积同时读取相邻 BEV 网格和 Camera/LiDAR 的全部 336 个输入通道，把两种模态局部混合为 256 通道。",
+            "concat [1,336,180,180] FP16。",
+            "Conv2d(k=3,s=1,p=1, 336→256) → BatchNorm2d → ReLU；空间尺寸保持 180×180。",
+            "fused [1,256,180,180] FP16。",
+            ["convfuser-config", "fusion-export", "fusion-bindings"],
+            notes=["TensorRT 构建时通常把 BatchNorm 参数折叠进卷积，并把激活与卷积融合；图中按训练框架的逻辑层展示。"],
+            related=["fusion-concat", "second-stage0"], view="fusion",
+            formula="F = ReLU(BN(Conv3×3,s1,p1(X)))\n[1,336,180,180] → [1,256,180,180]"
+        ),
+        "second-stage0": node(
+            "SECOND Stage 0", "6×Conv3×3 · 180×180", "compute",
+            "BEV decoder 的第一尺度保持 180×180 分辨率，先把通道从 256 压到 128，再用五层同尺度卷积继续提取局部空间上下文。",
+            "ConvFuser 输出 [1,256,180,180]。",
+            "入口 Conv3×3 s1 p1: 256→128；再执行 5×(Conv3×3 s1 p1: 128→128)；每层后接 BN + ReLU。",
+            "B0 [1,128,180,180] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            notes=["layer_nums[0]=5 表示入口卷积之后再接 5 个卷积，因此这一 stage 共 6 个 Conv-BN-ReLU。"],
+            related=["convfuser", "second-stage1", "fpn-conv"], view="fusion",
+            formula="B0 = SECOND₀(F)\n[1,256,180,180] → [1,128,180,180]"
+        ),
+        "second-stage1": node(
+            "SECOND Stage 1", "stride 2 · 6×Conv3×3 · 90×90", "compute",
+            "第二尺度先用步长 2 下采样，将感受野扩大到更粗的 90×90 BEV 网格，并把通道升到 256。",
+            "B0 [1,128,180,180] FP16。",
+            "入口 Conv3×3 s2 p1: 128→256；再执行 5×(Conv3×3 s1 p1: 256→256)；每层后接 BN + ReLU。",
+            "B1 [1,256,90,90] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            notes=["layer_nums[1]=5 同样表示入口卷积之后再接 5 个卷积。"],
+            related=["second-stage0", "fpn-deconv"], view="fusion",
+            formula="B1 = SECOND₁(B0)\n[1,128,180,180] → [1,256,90,90]"
+        ),
+        "fpn-conv": node(
+            "SECONDFPN 高分辨率支路", "1×1 Conv · 128→256", "compute",
+            "保留 SECOND Stage 0 的 180×180 细粒度位置特征，只调整通道数以便与低分辨率支路对齐。",
+            "B0 [1,128,180,180] FP16。",
+            "Conv1×1 s1: 128→256 → BN → ReLU。",
+            "U0 [1,256,180,180] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            related=["second-stage0", "fpn-concat"], view="fusion",
+            formula="U0 = ReLU(BN(Conv1×1(B0)))\n[1,128,180,180] → [1,256,180,180]"
+        ),
+        "fpn-deconv": node(
+            "SECONDFPN 低分辨率支路", "2×2 Deconv · stride 2", "compute",
+            "把 SECOND Stage 1 的 90×90 粗尺度语义特征上采样回 180×180，并保持 256 个输出通道。",
+            "B1 [1,256,90,90] FP16。",
+            "ConvTranspose2d(k=2,s=2, 256→256) → BN → ReLU。",
+            "U1 [1,256,180,180] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            related=["second-stage1", "fpn-concat"], view="fusion",
+            formula="U1 = ReLU(BN(Deconv2×2,s2(B1)))\n[1,256,90,90] → [1,256,180,180]"
+        ),
+        "fpn-concat": node(
+            "SECONDFPN 多尺度拼接", "Cat(dim=1) · 256 + 256 = 512", "compute",
+            "两条 FPN 支路都已经对齐为 180×180；沿通道维拼接后，同时保留细粒度位置特征与下采样尺度的上下文。",
+            "U0 [1,256,180,180]；U1 [1,256,180,180]。",
+            "middle = Cat(U0, U1, dim=1)。",
+            "middle [1,512,180,180] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            related=["fpn-conv", "fpn-deconv", "fused-bev"], view="fusion",
+            formula="middle = Cat(U0, U1, dim=1)\n[1,256,180,180] + [1,256,180,180] → [1,512,180,180]"
+        ),
+        "bev-decoder": node(
+            "BEV Decoder", "SECOND + SECONDFPN · two-scale", "compute",
+            "总览节点：SECOND 产生 180×180 和 90×90 两个尺度，SECONDFPN 将两路都变为 256×180×180，最后沿通道维拼接。",
+            "ConvFuser 输出 [1,256,180,180]。",
+            "SECOND stage0/stage1 → 1×1 Conv 高分辨率支路 + 2×2 Deconv s2 低分辨率支路 → Cat(dim=1)。",
+            "middle [1,512,180,180] FP16。",
+            ["fusion-export", "fusion-bindings", "manifest-fusion"],
+            related=["second-stage0", "second-stage1", "fpn-conv", "fpn-deconv", "fpn-concat"], view="fusion"
         ),
         "fuser": node(
             "BEV Feature Fuser", "fuser.plan · TensorRT FP16", "compute",
@@ -345,7 +427,7 @@ def build_catalog() -> dict:
             "camera BEV + LiDAR BEV。",
             "由 fuser.plan 输出，直接绑定到 head.bbox.plan。",
             "middle [1,512,180,180]。",
-            ["fusion-runtime", "fusion-bindings", "manifest-fusion", "manifest-head"], related=["fuser", "proposal"]
+            ["fusion-runtime", "fusion-bindings", "manifest-fusion", "manifest-head"], related=["fpn-concat", "proposal"]
         ),
         "proposal": node(
             "Heatmap + Top-200 Queries", "heatmap-guided query initialization", "compute",
@@ -410,8 +492,8 @@ def build_catalog() -> dict:
         {
             "id": "overview",
             "title": "完整模型",
-            "subtitle": "从同步相机/点云输入到 3D 检测框。两条感知分支在 180×180 BEV 空间对齐并融合。",
-            "rows": 9,
+            "subtitle": "从同步相机/点云输入到 3D 检测框。Camera 与 LiDAR 特征在 180×180 BEV 空间对齐，先做通道拼接，再由 ConvFuser 和两尺度 BEV Decoder 提取特征。",
+            "rows": 11,
             "nodes": [
                 {"id": "input", "row": 0, "col": 2, "caption": "6×Camera · LiDAR [N,5] · Calibration"},
                 {"id": "images", "row": 1, "col": 1, "caption": "6×1600×900 RGB"},
@@ -421,11 +503,13 @@ def build_catalog() -> dict:
                 {"id": "lidar-pipeline", "row": 2, "col": 3, "caption": "开源 libscn.so + libspconv.so"},
                 {"id": "camera-bev", "row": 3, "col": 1},
                 {"id": "lidar-bev", "row": 3, "col": 3},
-                {"id": "fuser", "row": 4, "col": 2, "caption": "fuser.plan · camera + lidar"},
-                {"id": "fused-bev", "row": 5, "col": 2},
-                {"id": "transformer-head", "row": 6, "col": 2, "caption": "Top-200 object queries"},
-                {"id": "decode", "row": 7, "col": 2},
-                {"id": "output", "row": 8, "col": 2, "caption": "3D boxes · score · class · velocity"},
+                {"id": "fusion-concat", "row": 4, "col": 2, "caption": "Cat(C) · 80 + 256 → [1,336,180,180]"},
+                {"id": "convfuser", "row": 5, "col": 2, "caption": "3×3 Conv + BN + ReLU → [1,256,180,180]"},
+                {"id": "bev-decoder", "row": 6, "col": 2, "caption": "SECOND + SECONDFPN → 256 + 256"},
+                {"id": "fused-bev", "row": 7, "col": 2},
+                {"id": "transformer-head", "row": 8, "col": 2, "caption": "Top-200 object queries"},
+                {"id": "decode", "row": 9, "col": 2},
+                {"id": "output", "row": 10, "col": 2, "caption": "3D boxes · score · class · velocity"},
             ],
             "edges": [
                 {"from": "input", "to": "images", "kind": "data"},
@@ -437,14 +521,16 @@ def build_catalog() -> dict:
                 {"from": "points", "to": "lidar-pipeline", "kind": "data"},
                 {"from": "camera-pipeline", "to": "camera-bev", "kind": "data"},
                 {"from": "lidar-pipeline", "to": "lidar-bev", "kind": "data"},
-                {"from": "camera-bev", "to": "fuser", "kind": "data"},
-                {"from": "lidar-bev", "to": "fuser", "kind": "data"},
-                {"from": "fuser", "to": "fused-bev", "kind": "data"},
+                {"from": "camera-bev", "to": "fusion-concat", "kind": "data", "label": "C=80"},
+                {"from": "lidar-bev", "to": "fusion-concat", "kind": "data", "label": "C=256"},
+                {"from": "fusion-concat", "to": "convfuser", "kind": "data", "label": "C=336"},
+                {"from": "convfuser", "to": "bev-decoder", "kind": "data", "label": "C=256"},
+                {"from": "bev-decoder", "to": "fused-bev", "kind": "data", "label": "Cat 256+256"},
                 {"from": "fused-bev", "to": "transformer-head", "kind": "data"},
                 {"from": "transformer-head", "to": "decode", "kind": "data"},
                 {"from": "decode", "to": "output", "kind": "data"},
             ],
-            "footnote": "实际 Core::forward 在同一 CUDA stream 上先计算 LiDAR sparse backbone，再计算相机分支，然后执行 fuser 与检测头；本图按数据依赖并列展示两条分支。LiDAR 点云还会进入相机深度投影，这是两分支间的交叉输入。",
+            "footnote": "实际 Core::forward 在同一 CUDA stream 上先计算 LiDAR sparse backbone，再计算相机分支，然后执行 fuser.plan 与检测头；本图按数据依赖并列展示两条分支。这里明确画出第一次 Cat：Camera 80 通道与 LiDAR 256 通道拼成 336 通道。切换到“展开 BEV 融合与检测头”可查看 SECOND/SECONDFPN 的每条支路和第二次 Cat。",
         },
         {
             "id": "camera",
@@ -512,41 +598,54 @@ def build_catalog() -> dict:
         {
             "id": "fusion",
             "title": "展开 BEV 融合与检测头",
-            "subtitle": "两种传感器特征在同一 180×180 网格融合，TransFusion 用 200 个 object query 预测并解码 3D 框。",
-            "rows": 8,
+            "subtitle": "逐层展示两次通道拼接、ConvFuser、SECOND 两个尺度和 SECONDFPN 两条对齐支路；随后 TransFusion 用 200 个 object query 预测并解码 3D 框。",
+            "rows": 13,
             "nodes": [
                 {"id": "camera-bev", "row": 0, "col": 1, "caption": "[1,80,180,180]"},
                 {"id": "lidar-bev", "row": 0, "col": 3, "caption": "[1,256,180,180]"},
-                {"id": "fuser", "row": 1, "col": 2, "caption": "Cat 336 → ConvFuser 256 → SECOND → FPN 256+256"},
-                {"id": "fused-bev", "row": 2, "col": 2, "caption": "middle [1,512,180,180]"},
-                {"id": "proposal", "row": 3, "col": 2, "caption": "dense heatmap → local max → Top-200"},
-                {"id": "transformer-head", "row": 4, "col": 2, "caption": "query feature + BEV key/value"},
-                {"id": "raw-head", "row": 5, "col": 2, "caption": "score / rot / dim / reg / height / vel"},
-                {"id": "decode", "row": 6, "col": 2, "caption": "threshold 0.12 + range filter + sort"},
-                {"id": "output", "row": 7, "col": 2, "caption": "K≤200 3D boxes"},
+                {"id": "fusion-concat", "row": 1, "col": 2, "caption": "Cat(C) → [1,336,180,180]"},
+                {"id": "convfuser", "row": 2, "col": 2, "caption": "Conv3×3 + BN + ReLU → [1,256,180,180]"},
+                {"id": "second-stage0", "row": 3, "col": 2, "caption": "256→128 · 6×Conv3×3 → [1,128,180,180]"},
+                {"id": "second-stage1", "row": 4, "col": 2, "caption": "128→256 · first stride 2 → [1,256,90,90]"},
+                {"id": "fpn-conv", "row": 5, "col": 1, "caption": "1×1 Conv → [1,256,180,180]"},
+                {"id": "fpn-deconv", "row": 5, "col": 3, "caption": "2×2 Deconv s2 → [1,256,180,180]"},
+                {"id": "fpn-concat", "row": 6, "col": 2, "caption": "Cat(C) · 256 + 256 → [1,512,180,180]"},
+                {"id": "fused-bev", "row": 7, "col": 2, "caption": "middle [1,512,180,180]"},
+                {"id": "proposal", "row": 8, "col": 2, "caption": "dense heatmap → local max → Top-200"},
+                {"id": "transformer-head", "row": 9, "col": 2, "caption": "query feature + BEV key/value"},
+                {"id": "raw-head", "row": 10, "col": 2, "caption": "score / rot / dim / reg / height / vel"},
+                {"id": "decode", "row": 11, "col": 2, "caption": "threshold 0.12 + range filter + sort"},
+                {"id": "output", "row": 12, "col": 2, "caption": "K≤200 3D boxes"},
             ],
             "edges": [
-                {"from": "camera-bev", "to": "fuser", "kind": "data"},
-                {"from": "lidar-bev", "to": "fuser", "kind": "data"},
-                {"from": "fuser", "to": "fused-bev", "kind": "data"},
+                {"from": "camera-bev", "to": "fusion-concat", "kind": "data", "label": "C=80"},
+                {"from": "lidar-bev", "to": "fusion-concat", "kind": "data", "label": "C=256"},
+                {"from": "fusion-concat", "to": "convfuser", "kind": "data", "label": "C=336"},
+                {"from": "convfuser", "to": "second-stage0", "kind": "data", "label": "C=256"},
+                {"from": "second-stage0", "to": "second-stage1", "kind": "data", "label": "stride 2"},
+                {"from": "second-stage0", "to": "fpn-conv", "kind": "data", "label": "high-res skip"},
+                {"from": "second-stage1", "to": "fpn-deconv", "kind": "data", "label": "90→180"},
+                {"from": "fpn-conv", "to": "fpn-concat", "kind": "data", "label": "C=256"},
+                {"from": "fpn-deconv", "to": "fpn-concat", "kind": "data", "label": "C=256"},
+                {"from": "fpn-concat", "to": "fused-bev", "kind": "data", "label": "C=512"},
                 {"from": "fused-bev", "to": "proposal", "kind": "data"},
                 {"from": "proposal", "to": "transformer-head", "kind": "data"},
                 {"from": "transformer-head", "to": "raw-head", "kind": "data"},
                 {"from": "raw-head", "to": "decode", "kind": "data"},
                 {"from": "decode", "to": "output", "kind": "data"},
             ],
-            "footnote": "fuser.plan 已包含 ConvFuser、decoder backbone 与 neck；head.bbox.plan 包含 proposal 初始化、Transformer decoder 和六组预测 head。C++ 端只负责 CUDA 解码、阈值/范围过滤及排序。当前导出路径只支持 object 3D detection。",
+            "footnote": "fuser.plan 内含整个浅蓝色数据流：第一次 Cat(C) 将 Camera/LiDAR 的 80+256 通道拼为 336，ConvFuser 压到 256；SECOND 产生 B0/B1 两个尺度；SECONDFPN 分别用 1×1 Conv 和 2×2 Deconv s2 得到两个 256 通道分支，第二次 Cat(C) 才形成 middle 的 512 通道。head.bbox.plan 包含 proposal 初始化、Transformer decoder 和六组预测 head。",
         },
     ]
 
     return {
         "title": "BEVFusion · TensorRT 推理架构与源码",
         "sourceRoot": "Robot_infer/bevfusion_agx/ · master",
-        "generatedNote": "2026-10-25 · 依据当前 master 的 C++/CUDA 推理路径、TensorRT 导出脚本、已验证 engine manifest 与项目内开放稀疏后端生成。",
+        "generatedNote": "2026-10-26 · 依据当前 master 的 C++/CUDA 推理路径、TensorRT 导出脚本、已验证 engine manifest 与项目内开放稀疏后端生成。",
         "sources": sources,
         "nodes": nodes,
         "views": views,
-        "quickNodes": ["core", "engine-files", "camera-backbone", "libscn", "libspconv", "fuser", "raw-head"],
+        "quickNodes": ["core", "engine-files", "camera-backbone", "libscn", "libspconv", "fusion-concat", "convfuser", "raw-head"],
     }
 
 
