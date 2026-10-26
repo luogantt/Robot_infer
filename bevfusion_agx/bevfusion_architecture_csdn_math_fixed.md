@@ -79,44 +79,44 @@ flowchart TD
 
 假设输入六路相机：
 
-\[
+$$
 I\in\mathbb{R}^{B\times 6\times 3\times H\times W}
-\]
+$$
 
 经过 Swin Transformer 与 FPN，得到多尺度图像特征：
 
-\[
+$$
 F_{\mathrm{img}}\in
 \mathbb{R}^{B\times N_{\mathrm{cam}}\times C\times H'\times W'}
-\]
+$$
 
 其中：
-- \(B\)：batch size；
-- \(N_{\mathrm{cam}}\)：相机数量；
-- \(C\)：图像特征通道数；
-- \(H',W'\)：特征图空间尺寸。
+- $B$：batch size；
+- $N_{\mathrm{cam}}$：相机数量；
+- $C$：图像特征通道数；
+- $H',W'$：特征图空间尺寸。
 
 ### 4.2 深度分布与上下文特征
 
 LSS 为图像特征位置预测深度概率：
 
-\[
+$$
 P(d\mid u,v)
-\]
+$$
 
 同时产生用于表达语义内容的 Context Feature：
 
-\[
+$$
 F(u,v)
-\]
+$$
 
 两者结合，形成视锥特征：
 
-\[
+$$
 F_{\mathrm{3D}}(u,v,d)
 =
 F(u,v)\cdot P(d\mid u,v)
-\]
+$$
 
 直观上，一个像素的语义特征会按不同深度假设分配到三维视锥中的多个位置。
 
@@ -137,9 +137,9 @@ flowchart TD
 
 构造稠密视锥特征的张量规模大致随相机数量、图像特征尺寸、深度分桶数和通道数增长：
 
-\[
+$$
 O(N_{\mathrm{cam}}\cdot H'\cdot W'\cdot D\cdot C)
-\]
+$$
 
 这只是对稠密视锥特征规模的近似描述，不等于经过优化后的完整实际推理复杂度。
 
@@ -151,9 +151,9 @@ LiDAR 已经直接测得三维点的位置，因此不需要像 Camera 一样从
 
 点云可以写作：
 
-\[
+$$
 P=\{(x_i,y_i,z_i,r_i,\ldots)\}_{i=1}^{N}
-\]
+$$
 
 这里的点特征字段取决于数据集和预处理配置。nuScenes 常见输入包括 XYZ、反射强度，以及配置可能使用的其他特征。
 
@@ -161,15 +161,15 @@ P=\{(x_i,y_i,z_i,r_i,\ldots)\}_{i=1}^{N}
 
 根据体素尺寸，把点映射到离散三维体素坐标：
 
-\[
+$$
 (x,y,z)\rightarrow(v_x,v_y,v_z)
-\]
+$$
 
 指定配置使用的体素尺寸示例为：
 
-\[
+$$
 (0.075,\ 0.075,\ 0.2)\ \text{m}
-\]
+$$
 
 实际点云范围和体素参数以所用配置为准。
 
@@ -204,19 +204,19 @@ model:
 
 也就是说，Camera BEV 为 80 通道，LiDAR BEV 为 256 通道，拼接后为 336 通道，再经卷积融合到 256 通道。
 
-\[
+$$
 F_{\mathrm{concat}}
 =
-\operatorname{Concat}
+\mathrm{Concat}
 (F_{\mathrm{camera}},F_{\mathrm{lidar}})
-\]
+$$
 
-\[
+$$
 F_{\mathrm{fused}}
 =
-\operatorname{Conv}_{3\times3}
+\mathrm{Conv}_{3\times3}
 (F_{\mathrm{concat}})
-\]
+$$
 
 实际 ConvFuser 还包含配置中的归一化与激活操作（例如 BatchNorm、ReLU）。
 
@@ -256,9 +256,9 @@ flowchart TD
 
 一种常见的三维框表示为：
 
-\[
+$$
 b=(x,y,z,w,l,h,\theta,v_x,v_y)
-\]
+$$
 
 具体回归字段由数据集、检测头配置和实现决定，输出还包括类别与置信度。
 
@@ -276,15 +276,15 @@ b=(x,y,z,w,l,h,\theta,v_x,v_y)
 
 因此，如果要为 BEVFusion 增加时序信息，可以把历史 BEV 对齐到当前自车坐标系后，再与当前 BEV 融合：
 
-\[
+$$
 F_t^{\mathrm{temporal}}
 =
-\operatorname{TemporalFusion}
+\mathrm{TemporalFusion}
 \left(
 F_t^{\mathrm{BEV}},
 \operatorname{Warp}(F_{t-1}^{\mathrm{BEV}})
 \right)
-\]
+$$
 
 这是一种通用的时序融合示意，不是 MIT 原版 BEVFusion 的内置模块。需要另外验证动态物体残影、时间对齐和推理延迟。
 
